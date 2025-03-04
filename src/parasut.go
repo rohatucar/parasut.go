@@ -797,6 +797,43 @@ func (api *API) GetContact(request *Request) (response Response) {
 	return response
 }
 
+func (api *API) UpdateContact(request *Request) (response Response) {
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/contacts/" + request.Contact.Data.ID + "?include=category,contact_portal,contact_people"
+	request.Contact.Data.Type = "contacts"
+	payload, _ := json.Marshal(request.Contact)
+	client := new(http.Client)
+	req, err := http.NewRequest("PUT", endpoint, bytes.NewReader(payload))
+	if err != nil {
+		log.Println(err)
+		return response
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
+	res, err := client.Do(req)
+	if err != nil {
+		log.Println(err)
+		return response
+	}
+	if res.StatusCode == http.StatusUnauthorized {
+		if api.RefreshToken() {
+			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
+			res, err = client.Do(req)
+			if err != nil {
+				log.Println(err)
+				return response
+			}
+		} else {
+			log.Println("Failed to refresh token")
+			return response
+		}
+	}
+	defer res.Body.Close()
+	decoder := json.NewDecoder(res.Body)
+	decoder.UseNumber()
+	decoder.Decode(&response.Contact)
+	return response
+}
+
 func (api *API) ShowContact(request *Request) (response Response) {
 	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/contacts/" + request.Contact.Data.ID + "?include=category,contact_portal,contact_people"
 	client := new(http.Client)
