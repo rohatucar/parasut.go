@@ -157,7 +157,7 @@ type Request struct {
 				VatExemptionReasonCode string `json:"vat_exemption_reason_code,omitempty"`
 				VatExemptionReason     string `json:"vat_exemption_reason,omitempty"`
 				Note                   string `json:"note,omitempty"`
-				ExciseDutyCodes        struct {
+				ExciseDutyCodes        []struct {
 					Product             string `json:"product,omitempty"`
 					SalesExciseDutyCode string `json:"sales_excise_duty_code,omitempty"`
 				} `json:"excise_duty_codes,omitempty"`
@@ -192,7 +192,7 @@ type Request struct {
 				VatExemptionReasonCode string `json:"vat_exemption_reason_code,omitempty"`
 				VatExemptionReason     string `json:"vat_exemption_reason,omitempty"`
 				Note                   string `json:"note,omitempty"`
-				ExciseDutyCodes        struct {
+				ExciseDutyCodes        []struct {
 					Product             string `json:"product,omitempty"`
 					SalesExciseDutyCode string `json:"sales_excise_duty_code,omitempty"`
 				} `json:"excise_duty_codes,omitempty"`
@@ -572,7 +572,8 @@ type Response struct {
 			Type       string `json:"type,omitempty"`
 			ID         string `json:"id,omitempty"`
 			Attributes struct {
-				Status string `json:"status,omitempty"`
+				Status string   `json:"status,omitempty"`
+				Errors []string `json:"errors,omitempty"`
 			} `json:"attributes,omitempty"`
 		} `json:"data,omitempty"`
 	}
@@ -607,7 +608,31 @@ func (api *API) Authorize() bool {
 	apidata.Add("grant_type", "password")
 	apidata.Add("redirect_uri", "urn:ietf:wg:oauth:2.0:oob")
 	client := new(http.Client)
-	req, err := http.NewRequest("POST", "https://api.parasut.com/oauth/token", strings.NewReader(apidata.Encode()))
+	req, err := http.NewRequest("POST", "https://api.heroku-staging.parasut.com/oauth/token", strings.NewReader(apidata.Encode()))
+	if err != nil {
+		log.Println(err)
+		return false
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		log.Println(err)
+		return false
+	}
+	defer res.Body.Close()
+	decoder := json.NewDecoder(res.Body)
+	decoder.UseNumber()
+	decoder.Decode(&api.Authentication)
+	return true
+}
+
+func (api *API) RefreshToken() bool {
+	apidata := url.Values{}
+	apidata.Add("client_id", api.Config.ClientID)
+	apidata.Add("client_secret", api.Config.ClientSecret)
+	apidata.Add("refresh_token", api.Authentication.RefreshToken)
+	apidata.Add("grant_type", "refresh_token")
+	client := new(http.Client)
+	req, err := http.NewRequest("POST", "https://api.heroku-staging.parasut.com/oauth/token", strings.NewReader(apidata.Encode()))
 	if err != nil {
 		log.Println(err)
 		return false
@@ -625,7 +650,7 @@ func (api *API) Authorize() bool {
 }
 
 func (api *API) CreateContact(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/contacts?include=category,contact_portal,contact_people"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/contacts?include=category,contact_portal,contact_people"
 	request.Contact.Data.Type = "contacts"
 	payload, _ := json.Marshal(request.Contact)
 	client := new(http.Client)
@@ -641,6 +666,19 @@ func (api *API) CreateContact(request *Request) (response Response) {
 		log.Println(err)
 		return response
 	}
+	if res.StatusCode == http.StatusUnauthorized {
+		if api.RefreshToken() {
+			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
+			res, err = client.Do(req)
+			if err != nil {
+				log.Println(err)
+				return response
+			}
+		} else {
+			log.Println("Failed to refresh token")
+			return response
+		}
+	}
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
@@ -648,8 +686,119 @@ func (api *API) CreateContact(request *Request) (response Response) {
 	return response
 }
 
+func (api *API) GetContact(request *Request) (response Response) {
+	// if attributes are empty, do not include them in the query
+	filters := []string{}
+	if request.Contact.Data.Attributes.Name != "" {
+		filters = append(filters, "filter[name]="+request.Contact.Data.Attributes.Name)
+	}
+	if request.Contact.Data.Attributes.Email != "" {
+		filters = append(filters, "filter[email]="+request.Contact.Data.Attributes.Email)
+	}
+	if request.Contact.Data.Attributes.TaxNumber != "" {
+		filters = append(filters, "filter[tax_number]="+request.Contact.Data.Attributes.TaxNumber)
+	}
+	if request.Contact.Data.Attributes.TaxOffice != "" {
+		filters = append(filters, "filter[tax_office]="+request.Contact.Data.Attributes.TaxOffice)
+	}
+	if request.Contact.Data.Attributes.City != "" {
+		filters = append(filters, "filter[city]="+request.Contact.Data.Attributes.City)
+	}
+	if request.Contact.Data.Attributes.AccountType != "" {
+		filters = append(filters, "filter[account_type]="+request.Contact.Data.Attributes.AccountType)
+	}
+	query := strings.Join(filters, "&")
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/contacts?" + query + "&include=category,contact_portal,contact_people"
+
+	client := new(http.Client)
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		log.Println(err)
+		return response
+	}
+	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
+	res, err := client.Do(req)
+	if err != nil {
+		log.Println(err)
+		return response
+	}
+	defer res.Body.Close()
+
+	decoder := json.NewDecoder(res.Body)
+	decoder.UseNumber()
+	var getResult struct {
+		Data []struct {
+			Type       string `json:"type,omitempty"`
+			ID         string `json:"id,omitempty"`
+			Attributes struct {
+				Name        string `json:"name,omitempty"`
+				ShortName   string `json:"short_name,omitempty"`
+				Email       string `json:"email,omitempty"`
+				AccountType string `json:"account_type,omitempty"`
+				ContactType string `json:"contact_type,omitempty"`
+				IBAN        string `json:"iban,omitempty"`
+				TaxOffice   string `json:"tax_office,omitempty"`
+				TaxNumber   string `json:"tax_number,omitempty"`
+				Country     string `json:"country,omitempty"`
+				City        string `json:"city,omitempty"`
+				District    string `json:"district,omitempty"`
+				Address     string `json:"address,omitempty"`
+				Phone       string `json:"phone,omitempty"`
+				Fax         string `json:"fax,omitempty"`
+				IsAbroad    bool   `json:"is_abroad,omitempty"`
+				Archived    bool   `json:"archived,omitempty"`
+			} `json:"attributes,omitempty"`
+			Relationships struct {
+				Category      *SingleRelationShip `json:"category,omitempty"`
+				ContactPortal *SingleRelationShip `json:"contact_portal,omitempty"`
+				ContactPeople *MultiRelationShip  `json:"contact_people,omitempty"`
+			} `json:"relationships,omitempty"`
+		} `json:"data,omitempty"`
+	}
+
+	err = decoder.Decode(&getResult)
+	if err != nil {
+		log.Println(err)
+	}
+	if len(getResult.Data) > 1 {
+		response.Contact.Errors = append(response.Contact.Errors, struct {
+			Title  string `json:"title,omitempty"`
+			Detail string `json:"detail,omitempty"`
+		}{
+			Title:  "Multiple contacts found",
+			Detail: "The query returned more than one contact",
+		})
+
+		return response
+	}
+	if len(getResult.Data) == 1 {
+		response.Contact.Data.Type = getResult.Data[0].Type
+		response.Contact.Data.ID = getResult.Data[0].ID
+		response.Contact.Data.Attributes.Name = getResult.Data[0].Attributes.Name
+		response.Contact.Data.Attributes.ShortName = getResult.Data[0].Attributes.ShortName
+		response.Contact.Data.Attributes.Email = getResult.Data[0].Attributes.Email
+		response.Contact.Data.Attributes.AccountType = getResult.Data[0].Attributes.AccountType
+		response.Contact.Data.Attributes.ContactType = getResult.Data[0].Attributes.ContactType
+		response.Contact.Data.Attributes.IBAN = getResult.Data[0].Attributes.IBAN
+		response.Contact.Data.Attributes.TaxOffice = getResult.Data[0].Attributes.TaxOffice
+		response.Contact.Data.Attributes.TaxNumber = getResult.Data[0].Attributes.TaxNumber
+		response.Contact.Data.Attributes.Country = getResult.Data[0].Attributes.Country
+		response.Contact.Data.Attributes.City = getResult.Data[0].Attributes.City
+		response.Contact.Data.Attributes.District = getResult.Data[0].Attributes.District
+		response.Contact.Data.Attributes.Address = getResult.Data[0].Attributes.Address
+		response.Contact.Data.Attributes.Phone = getResult.Data[0].Attributes.Phone
+		response.Contact.Data.Attributes.Fax = getResult.Data[0].Attributes.Fax
+		response.Contact.Data.Attributes.IsAbroad = getResult.Data[0].Attributes.IsAbroad
+		response.Contact.Data.Attributes.Archived = getResult.Data[0].Attributes.Archived
+		response.Contact.Data.Relationships.Category = getResult.Data[0].Relationships.Category
+		response.Contact.Data.Relationships.ContactPortal = getResult.Data[0].Relationships.ContactPortal
+		response.Contact.Data.Relationships.ContactPeople = getResult.Data[0].Relationships.ContactPeople
+	}
+	return response
+}
+
 func (api *API) ShowContact(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/contacts/" + request.Contact.Data.ID + "?include=category,contact_portal,contact_people"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/contacts/" + request.Contact.Data.ID + "?include=category,contact_portal,contact_people"
 	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
@@ -670,7 +819,7 @@ func (api *API) ShowContact(request *Request) (response Response) {
 }
 
 func (api *API) DeleteContact(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/contacts/" + request.Contact.Data.ID
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/contacts/" + request.Contact.Data.ID
 	client := new(http.Client)
 	req, err := http.NewRequest("DELETE", endpoint, nil)
 	if err != nil {
@@ -692,7 +841,7 @@ func (api *API) DeleteContact(request *Request) (response Response) {
 }
 
 func (api *API) ArchiveContact(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/contacts/" + request.Contact.Data.ID + "/archive"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/contacts/" + request.Contact.Data.ID + "/archive"
 	client := new(http.Client)
 	req, err := http.NewRequest("PATCH", endpoint, nil)
 	if err != nil {
@@ -714,7 +863,7 @@ func (api *API) ArchiveContact(request *Request) (response Response) {
 }
 
 func (api *API) UnarchiveContact(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/contacts/" + request.Contact.Data.ID + "/unarchive"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/contacts/" + request.Contact.Data.ID + "/unarchive"
 	client := new(http.Client)
 	req, err := http.NewRequest("PATCH", endpoint, nil)
 	if err != nil {
@@ -736,7 +885,7 @@ func (api *API) UnarchiveContact(request *Request) (response Response) {
 }
 
 func (api *API) CreateEmployee(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/employees?include=category,managed_by_user,managed_by_user_role"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/employees?include=category,managed_by_user,managed_by_user_role"
 	request.Employee.Data.Type = "employees"
 	payload, _ := json.Marshal(request.Employee)
 	client := new(http.Client)
@@ -760,7 +909,7 @@ func (api *API) CreateEmployee(request *Request) (response Response) {
 }
 
 func (api *API) ShowEmployee(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/employees/" + request.Employee.Data.ID + "?include=category,managed_by_user,managed_by_user_role"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/employees/" + request.Employee.Data.ID + "?include=category,managed_by_user,managed_by_user_role"
 	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
@@ -781,7 +930,7 @@ func (api *API) ShowEmployee(request *Request) (response Response) {
 }
 
 func (api *API) DeleteEmployee(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/employees/" + request.Employee.Data.ID
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/employees/" + request.Employee.Data.ID
 	client := new(http.Client)
 	req, err := http.NewRequest("DELETE", endpoint, nil)
 	if err != nil {
@@ -803,7 +952,7 @@ func (api *API) DeleteEmployee(request *Request) (response Response) {
 }
 
 func (api *API) ArchiveEmployee(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/employees/" + request.Employee.Data.ID + "/archive"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/employees/" + request.Employee.Data.ID + "/archive"
 	client := new(http.Client)
 	req, err := http.NewRequest("PATCH", endpoint, nil)
 	if err != nil {
@@ -825,7 +974,7 @@ func (api *API) ArchiveEmployee(request *Request) (response Response) {
 }
 
 func (api *API) UnarchiveEmployee(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/employees/" + request.Employee.Data.ID + "/unarchive"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/employees/" + request.Employee.Data.ID + "/unarchive"
 	client := new(http.Client)
 	req, err := http.NewRequest("PATCH", endpoint, nil)
 	if err != nil {
@@ -847,11 +996,48 @@ func (api *API) UnarchiveEmployee(request *Request) (response Response) {
 }
 
 func (api *API) CreateSalesInvoice(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices?include=category,contact,details,details.product,details.warehouse,payments,payments.transaction,tags,sharings,recurrence_plan,active_e_document"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices?include=category,contact,details,details.product,details.warehouse,payments,payments.transaction,tags,sharings,recurrence_plan,active_e_document"
 	request.SalesInvoice.Data.Type = "sales_invoices"
 	payload, _ := json.Marshal(request.SalesInvoice)
 	client := new(http.Client)
 	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
+	if err != nil {
+		log.Println(err)
+		return response
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
+	res, err := client.Do(req)
+	if err != nil {
+		log.Println(err)
+		return response
+	}
+	if res.StatusCode == http.StatusUnauthorized {
+		if api.RefreshToken() {
+			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
+			res, err = client.Do(req)
+			if err != nil {
+				log.Println(err)
+				return response
+			}
+		} else {
+			log.Println("Failed to refresh token")
+			return response
+		}
+	}
+	defer res.Body.Close()
+	decoder := json.NewDecoder(res.Body)
+	decoder.UseNumber()
+	decoder.Decode(&response.SalesInvoice)
+	return response
+}
+
+func (api *API) UpdateSalesInvoice(request *Request) (response Response) {
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices?include=category,contact,details,details.product,details.warehouse,payments,payments.transaction,tags,sharings,recurrence_plan,active_e_document"
+	request.SalesInvoice.Data.Type = "sales_invoices"
+	payload, _ := json.Marshal(request.SalesInvoice)
+	client := new(http.Client)
+	req, err := http.NewRequest("PUT", endpoint, bytes.NewReader(payload))
 	if err != nil {
 		log.Println(err)
 		return response
@@ -871,7 +1057,7 @@ func (api *API) CreateSalesInvoice(request *Request) (response Response) {
 }
 
 func (api *API) ShowSalesInvoice(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices/" + request.SalesInvoice.Data.ID + "?include=category,contact,details,details.product,details.warehouse,payments,payments.transaction,tags,sharings,recurrence_plan,active_e_document"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices/" + request.SalesInvoice.Data.ID + "?include=category,contact,details,details.product,details.warehouse,payments,payments.transaction,tags,sharings,recurrence_plan,active_e_document"
 	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
@@ -884,6 +1070,19 @@ func (api *API) ShowSalesInvoice(request *Request) (response Response) {
 		log.Println(err)
 		return response
 	}
+	if res.StatusCode == http.StatusUnauthorized {
+		if api.RefreshToken() {
+			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
+			res, err = client.Do(req)
+			if err != nil {
+				log.Println(err)
+				return response
+			}
+		} else {
+			log.Println("Failed to refresh token")
+			return response
+		}
+	}
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
@@ -892,7 +1091,7 @@ func (api *API) ShowSalesInvoice(request *Request) (response Response) {
 }
 
 func (api *API) CancelSalesInvoice(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices/" + request.SalesInvoice.Data.ID + "/cancel"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices/" + request.SalesInvoice.Data.ID + "/cancel"
 	client := new(http.Client)
 	req, err := http.NewRequest("DELETE", endpoint, nil)
 	if err != nil {
@@ -906,6 +1105,19 @@ func (api *API) CancelSalesInvoice(request *Request) (response Response) {
 		log.Println(err)
 		return response
 	}
+	if res.StatusCode == http.StatusUnauthorized {
+		if api.RefreshToken() {
+			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
+			res, err = client.Do(req)
+			if err != nil {
+				log.Println(err)
+				return response
+			}
+		} else {
+			log.Println("Failed to refresh token")
+			return response
+		}
+	}
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
@@ -914,7 +1126,7 @@ func (api *API) CancelSalesInvoice(request *Request) (response Response) {
 }
 
 func (api *API) DeleteSalesInvoice(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices/" + request.SalesInvoice.Data.ID
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices/" + request.SalesInvoice.Data.ID
 	client := new(http.Client)
 	req, err := http.NewRequest("DELETE", endpoint, nil)
 	if err != nil {
@@ -936,7 +1148,7 @@ func (api *API) DeleteSalesInvoice(request *Request) (response Response) {
 }
 
 func (api *API) ArchiveSalesInvoice(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices/" + request.SalesInvoice.Data.ID + "/archive"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices/" + request.SalesInvoice.Data.ID + "/archive"
 	client := new(http.Client)
 	req, err := http.NewRequest("PATCH", endpoint, nil)
 	if err != nil {
@@ -958,7 +1170,7 @@ func (api *API) ArchiveSalesInvoice(request *Request) (response Response) {
 }
 
 func (api *API) UnarchiveSalesInvoice(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices/" + request.SalesInvoice.Data.ID + "/unarchive"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices/" + request.SalesInvoice.Data.ID + "/unarchive"
 	client := new(http.Client)
 	req, err := http.NewRequest("PATCH", endpoint, nil)
 	if err != nil {
@@ -980,7 +1192,7 @@ func (api *API) UnarchiveSalesInvoice(request *Request) (response Response) {
 }
 
 func (api *API) CreateEArchive(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_archives"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/e_archives"
 	request.EArchive.Data.Type = "e_archives"
 	payload, _ := json.Marshal(request.EArchive)
 	client := new(http.Client)
@@ -996,6 +1208,19 @@ func (api *API) CreateEArchive(request *Request) (response Response) {
 		log.Println(err)
 		return response
 	}
+	if res.StatusCode == http.StatusUnauthorized {
+		if api.RefreshToken() {
+			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
+			res, err = client.Do(req)
+			if err != nil {
+				log.Println(err)
+				return response
+			}
+		} else {
+			log.Println("Failed to refresh token")
+			return response
+		}
+	}
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
@@ -1004,7 +1229,7 @@ func (api *API) CreateEArchive(request *Request) (response Response) {
 }
 
 func (api *API) ShowEArchive(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_archives/" + request.EArchive.Data.ID
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/e_archives/" + request.EArchive.Data.ID
 	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
@@ -1025,7 +1250,7 @@ func (api *API) ShowEArchive(request *Request) (response Response) {
 }
 
 func (api *API) CreateEInvoice(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_invoices"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/e_invoices"
 	request.EInvoice.Data.Type = "e_invoices"
 	payload, _ := json.Marshal(request.EInvoice)
 	client := new(http.Client)
@@ -1041,6 +1266,19 @@ func (api *API) CreateEInvoice(request *Request) (response Response) {
 		log.Println(err)
 		return response
 	}
+	if res.StatusCode == http.StatusUnauthorized {
+		if api.RefreshToken() {
+			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
+			res, err = client.Do(req)
+			if err != nil {
+				log.Println(err)
+				return response
+			}
+		} else {
+			log.Println("Failed to refresh token")
+			return response
+		}
+	}
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
@@ -1049,7 +1287,7 @@ func (api *API) CreateEInvoice(request *Request) (response Response) {
 }
 
 func (api *API) ShowEInvoice(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_invoices/" + request.EInvoice.Data.ID
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/e_invoices/" + request.EInvoice.Data.ID
 	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
@@ -1070,7 +1308,7 @@ func (api *API) ShowEInvoice(request *Request) (response Response) {
 }
 
 func (api *API) ShowEArchivePDF(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_archives/" + request.EArchivePDF.Data.ID + "/pdf"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/e_archives/" + request.EArchivePDF.Data.ID + "/pdf"
 	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
@@ -1091,7 +1329,7 @@ func (api *API) ShowEArchivePDF(request *Request) (response Response) {
 }
 
 func (api *API) ShowEInvoicePDF(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_invoices/" + request.EInvoicePDF.Data.ID + "/pdf"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/e_invoices/" + request.EInvoicePDF.Data.ID + "/pdf"
 	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
@@ -1112,7 +1350,7 @@ func (api *API) ShowEInvoicePDF(request *Request) (response Response) {
 }
 
 func (api *API) ListEInvoiceInboxes(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_invoice_inboxes?filter[vkn]=" + request.EInvoiceInboxes.Data.Attributes.VKN
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/e_invoice_inboxes?filter[vkn]=" + request.EInvoiceInboxes.Data.Attributes.VKN
 	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
@@ -1125,6 +1363,19 @@ func (api *API) ListEInvoiceInboxes(request *Request) (response Response) {
 		log.Println(err)
 		return response
 	}
+	if res.StatusCode == http.StatusUnauthorized {
+		if api.RefreshToken() {
+			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
+			res, err = client.Do(req)
+			if err != nil {
+				log.Println(err)
+				return response
+			}
+		} else {
+			log.Println("Failed to refresh token")
+			return response
+		}
+	}
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
@@ -1133,7 +1384,7 @@ func (api *API) ListEInvoiceInboxes(request *Request) (response Response) {
 }
 
 func (api *API) ShowTransaction(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/transactions/" + request.Transaction.Data.ID + "?include=debit_account,credit_account,payments"
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/transactions/" + request.Transaction.Data.ID + "?include=debit_account,credit_account,payments"
 	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
@@ -1154,7 +1405,7 @@ func (api *API) ShowTransaction(request *Request) (response Response) {
 }
 
 func (api *API) DeleteTransaction(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/transactions/" + request.Transaction.Data.ID
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/transactions/" + request.Transaction.Data.ID
 	client := new(http.Client)
 	req, err := http.NewRequest("DELETE", endpoint, nil)
 	if err != nil {
@@ -1176,9 +1427,9 @@ func (api *API) DeleteTransaction(request *Request) (response Response) {
 }
 
 func (api *API) TrackJob(request *Request) (response Response) {
-	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/trackable_jobs/" + request.TrackableJob.Data.ID
+	endpoint := "https://api.heroku-staging.parasut.com/v4/" + api.Config.CompanyID + "/trackable_jobs/" + request.TrackableJob.Data.ID
 	client := new(http.Client)
-	req, err := http.NewRequest("DELETE", endpoint, nil)
+	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		log.Println(err)
 		return response
@@ -1189,6 +1440,19 @@ func (api *API) TrackJob(request *Request) (response Response) {
 	if err != nil {
 		log.Println(err)
 		return response
+	}
+	if res.StatusCode == http.StatusUnauthorized {
+		if api.RefreshToken() {
+			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
+			res, err = client.Do(req)
+			if err != nil {
+				log.Println(err)
+				return response
+			}
+		} else {
+			log.Println("Failed to refresh token")
+			return response
+		}
 	}
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
