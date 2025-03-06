@@ -1213,32 +1213,20 @@ func (api *API) UpdateSalesInvoice(request *Request, options ...RetryOption) (re
 	return response
 }
 
-func (api *API) ShowSalesInvoice(request *Request) (response Response) {
+func (api *API) ShowSalesInvoice(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices/" + request.SalesInvoice.Data.ID + "?include=category,contact,details,details.product,details.warehouse,payments,payments.transaction,tags,sharings,recurrence_plan,active_e_document"
-	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
-	}
-	if res.StatusCode == http.StatusUnauthorized {
-		if api.RefreshToken() {
-			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-			res, err = client.Do(req)
-			if err != nil {
-				log.Println(err)
-				return response
-			}
-		} else {
-			log.Println("Failed to refresh token")
-			return response
-		}
 	}
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
