@@ -3,10 +3,13 @@ package parasut
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -599,6 +602,119 @@ type EInvoiceProduct struct {
 	} `json:"data,omitempty"`
 }
 
+type RetryConfig struct {
+	MaxRetries  int
+	RetryDelay  time.Duration
+	MaxDelay    time.Duration
+	Multiplier  float64
+	RetryOnCode map[int]bool
+}
+
+var defaultRetryConfig = RetryConfig{
+	MaxRetries:  0,
+	RetryDelay:  100 * time.Millisecond,
+	MaxDelay:    4 * time.Second,
+	Multiplier:  1.5,
+	RetryOnCode: map[int]bool{408: true, 429: true, 500: true, 502: true, 503: true, 504: true},
+}
+
+type RetryOption func(*RetryConfig)
+
+func WithMaxRetries(n int) RetryOption {
+	return func(c *RetryConfig) {
+		c.MaxRetries = n
+	}
+}
+
+func WithRetryDelay(delay time.Duration) RetryOption {
+	return func(c *RetryConfig) {
+		c.RetryDelay = delay
+	}
+}
+
+func WithMaxDelay(delay time.Duration) RetryOption {
+	return func(c *RetryConfig) {
+		c.MaxDelay = delay
+	}
+}
+
+func WithMultiplier(m float64) RetryOption {
+	return func(c *RetryConfig) {
+		c.Multiplier = m
+	}
+}
+
+func WithRetryOnStatusCodes(codes ...int) RetryOption {
+	return func(c *RetryConfig) {
+		c.RetryOnCode = make(map[int]bool)
+		for _, code := range codes {
+			c.RetryOnCode[code] = true
+		}
+	}
+}
+
+func (api *API) doWithRetry(req *http.Request, options ...RetryOption) (*http.Response, error) {
+	config := defaultRetryConfig
+
+	for _, opt := range options {
+		opt(&config)
+	}
+
+	var res *http.Response
+	var err error
+	delay := config.RetryDelay
+	client := &http.Client{}
+
+	for attempt := 0; attempt <= config.MaxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(delay)
+			delay = time.Duration(float64(delay) * config.Multiplier)
+			if delay > config.MaxDelay {
+				delay = config.MaxDelay
+			}
+
+			if req.Body != nil {
+				if req.GetBody != nil {
+					newBody, bodyErr := req.GetBody()
+					if bodyErr != nil {
+						return nil, bodyErr
+					}
+					req.Body = newBody
+				}
+			}
+		}
+
+		res, err = client.Do(req)
+
+		if err == nil && res.StatusCode < 400 {
+			return res, nil
+		}
+
+		if res != nil && res.StatusCode == http.StatusUnauthorized {
+			if api.RefreshToken() {
+				req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
+				continue
+			} else {
+				return res, nil
+			}
+		}
+
+		if res != nil && !config.RetryOnCode[res.StatusCode] && res.StatusCode < 500 {
+			return res, nil
+		}
+
+		if attempt == config.MaxRetries {
+			return res, err
+		}
+
+		if res != nil && res.Body != nil {
+			res.Body.Close()
+		}
+	}
+
+	return res, err
+}
+
 func (api *API) Authorize() bool {
 	apidata := url.Values{}
 	apidata.Add("client_id", api.Config.ClientID)
@@ -649,36 +765,33 @@ func (api *API) RefreshToken() bool {
 	return true
 }
 
-func (api *API) CreateContact(request *Request) (response Response) {
+func (api *API) CreateContact(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/contacts?include=category,contact_portal,contact_people"
 	request.Contact.Data.Type = "contacts"
 	payload, _ := json.Marshal(request.Contact)
-	client := new(http.Client)
+
 	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
+	bodyBytes := bytes.NewReader(payload)
+	req.Body = ioutil.NopCloser(bodyBytes)
+	req.GetBody = func() (io.ReadCloser, error) {
+		r := bytes.NewReader(payload)
+		return ioutil.NopCloser(r), nil
+	}
+
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
-	if res.StatusCode == http.StatusUnauthorized {
-		if api.RefreshToken() {
-			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-			res, err = client.Do(req)
-			if err != nil {
-				log.Println(err)
-				return response
-			}
-		} else {
-			log.Println("Failed to refresh token")
-			return response
-		}
-	}
+
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
@@ -686,7 +799,7 @@ func (api *API) CreateContact(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) GetContact(request *Request) (response Response) {
+func (api *API) GetContact(request *Request, options ...RetryOption) (response Response) {
 	// if attributes are empty, do not include them in the query
 	filters := []string{}
 	if request.Contact.Data.Attributes.Name != "" {
@@ -710,18 +823,20 @@ func (api *API) GetContact(request *Request) (response Response) {
 	query := strings.Join(filters, "&")
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/contacts?" + query + "&include=category,contact_portal,contact_people"
 
-	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
 	defer res.Body.Close()
 
 	decoder := json.NewDecoder(res.Body)
@@ -797,36 +912,33 @@ func (api *API) GetContact(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) UpdateContact(request *Request) (response Response) {
+func (api *API) UpdateContact(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/contacts/" + request.Contact.Data.ID + "?include=category,contact_portal,contact_people"
 	request.Contact.Data.Type = "contacts"
 	payload, _ := json.Marshal(request.Contact)
-	client := new(http.Client)
+
 	req, err := http.NewRequest("PUT", endpoint, bytes.NewReader(payload))
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
+	bodyBytes := bytes.NewReader(payload)
+	req.Body = ioutil.NopCloser(bodyBytes)
+	req.GetBody = func() (io.ReadCloser, error) {
+		r := bytes.NewReader(payload)
+		return ioutil.NopCloser(r), nil
+	}
+
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
-	if res.StatusCode == http.StatusUnauthorized {
-		if api.RefreshToken() {
-			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-			res, err = client.Do(req)
-			if err != nil {
-				log.Println(err)
-				return response
-			}
-		} else {
-			log.Println("Failed to refresh token")
-			return response
-		}
-	}
+
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
@@ -834,20 +946,23 @@ func (api *API) UpdateContact(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) ShowContact(request *Request) (response Response) {
+func (api *API) ShowContact(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/contacts/" + request.Contact.Data.ID + "?include=category,contact_portal,contact_people"
-	client := new(http.Client)
+
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
@@ -855,9 +970,8 @@ func (api *API) ShowContact(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) DeleteContact(request *Request) (response Response) {
+func (api *API) DeleteContact(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/contacts/" + request.Contact.Data.ID
-	client := new(http.Client)
 	req, err := http.NewRequest("DELETE", endpoint, nil)
 	if err != nil {
 		log.Println(err)
@@ -865,11 +979,13 @@ func (api *API) DeleteContact(request *Request) (response Response) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
@@ -1031,36 +1147,31 @@ func (api *API) UnarchiveEmployee(request *Request) (response Response) {
 	decoder.Decode(&response.Employee)
 	return response
 }
-
-func (api *API) CreateSalesInvoice(request *Request) (response Response) {
+func (api *API) CreateSalesInvoice(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices?include=category,contact,details,details.product,details.warehouse,payments,payments.transaction,tags,sharings,recurrence_plan,active_e_document"
 	request.SalesInvoice.Data.Type = "sales_invoices"
 	payload, _ := json.Marshal(request.SalesInvoice)
-	client := new(http.Client)
+
 	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
+	bodyBytes := bytes.NewReader(payload)
+	req.Body = ioutil.NopCloser(bodyBytes)
+	req.GetBody = func() (io.ReadCloser, error) {
+		r := bytes.NewReader(payload)
+		return ioutil.NopCloser(r), nil
+	}
+
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
-	}
-	if res.StatusCode == http.StatusUnauthorized {
-		if api.RefreshToken() {
-			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-			res, err = client.Do(req)
-			if err != nil {
-				log.Println(err)
-				return response
-			}
-		} else {
-			log.Println("Failed to refresh token")
-			return response
-		}
 	}
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
@@ -1069,19 +1180,28 @@ func (api *API) CreateSalesInvoice(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) UpdateSalesInvoice(request *Request) (response Response) {
+func (api *API) UpdateSalesInvoice(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices?include=category,contact,details,details.product,details.warehouse,payments,payments.transaction,tags,sharings,recurrence_plan,active_e_document"
 	request.SalesInvoice.Data.Type = "sales_invoices"
 	payload, _ := json.Marshal(request.SalesInvoice)
-	client := new(http.Client)
+
 	req, err := http.NewRequest("PUT", endpoint, bytes.NewReader(payload))
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
+	bodyBytes := bytes.NewReader(payload)
+	req.Body = ioutil.NopCloser(bodyBytes)
+	req.GetBody = func() (io.ReadCloser, error) {
+		r := bytes.NewReader(payload)
+		return ioutil.NopCloser(r), nil
+	}
+
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
@@ -1127,7 +1247,7 @@ func (api *API) ShowSalesInvoice(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) CancelSalesInvoice(request *Request) (response Response) {
+func (api *API) CancelSalesInvoice(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/sales_invoices/" + request.SalesInvoice.Data.ID + "/cancel"
 	client := new(http.Client)
 	req, err := http.NewRequest("DELETE", endpoint, nil)
@@ -1228,36 +1348,32 @@ func (api *API) UnarchiveSalesInvoice(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) CreateEArchive(request *Request) (response Response) {
+func (api *API) CreateEArchive(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_archives"
 	request.EArchive.Data.Type = "e_archives"
 	payload, _ := json.Marshal(request.EArchive)
-	client := new(http.Client)
 	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
+	bodyBytes := bytes.NewReader(payload)
+	req.Body = ioutil.NopCloser(bodyBytes)
+	req.GetBody = func() (io.ReadCloser, error) {
+		r := bytes.NewReader(payload)
+		return ioutil.NopCloser(r), nil
+	}
+
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
-	if res.StatusCode == http.StatusUnauthorized {
-		if api.RefreshToken() {
-			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-			res, err = client.Do(req)
-			if err != nil {
-				log.Println(err)
-				return response
-			}
-		} else {
-			log.Println("Failed to refresh token")
-			return response
-		}
-	}
+
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
@@ -1265,20 +1381,22 @@ func (api *API) CreateEArchive(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) ShowEArchive(request *Request) (response Response) {
+func (api *API) ShowEArchive(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_archives/" + request.EArchive.Data.ID
-	client := new(http.Client)
+
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
@@ -1286,36 +1404,33 @@ func (api *API) ShowEArchive(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) CreateEInvoice(request *Request) (response Response) {
+func (api *API) CreateEInvoice(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_invoices"
 	request.EInvoice.Data.Type = "e_invoices"
 	payload, _ := json.Marshal(request.EInvoice)
-	client := new(http.Client)
+
 	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
+	bodyBytes := bytes.NewReader(payload)
+	req.Body = ioutil.NopCloser(bodyBytes)
+	req.GetBody = func() (io.ReadCloser, error) {
+		r := bytes.NewReader(payload)
+		return ioutil.NopCloser(r), nil
+	}
+
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
-	if res.StatusCode == http.StatusUnauthorized {
-		if api.RefreshToken() {
-			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-			res, err = client.Do(req)
-			if err != nil {
-				log.Println(err)
-				return response
-			}
-		} else {
-			log.Println("Failed to refresh token")
-			return response
-		}
-	}
+
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
@@ -1323,16 +1438,15 @@ func (api *API) CreateEInvoice(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) ShowEInvoice(request *Request) (response Response) {
+func (api *API) ShowEInvoice(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_invoices/" + request.EInvoice.Data.ID
-	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
@@ -1344,16 +1458,15 @@ func (api *API) ShowEInvoice(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) ShowEArchivePDF(request *Request) (response Response) {
+func (api *API) ShowEArchivePDF(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_archives/" + request.EArchivePDF.Data.ID + "/pdf"
-	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
@@ -1365,16 +1478,15 @@ func (api *API) ShowEArchivePDF(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) ShowEInvoicePDF(request *Request) (response Response) {
+func (api *API) ShowEInvoicePDF(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_invoices/" + request.EInvoicePDF.Data.ID + "/pdf"
-	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
@@ -1386,32 +1498,18 @@ func (api *API) ShowEInvoicePDF(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) ListEInvoiceInboxes(request *Request) (response Response) {
+func (api *API) ListEInvoiceInboxes(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/e_invoice_inboxes?filter[vkn]=" + request.EInvoiceInboxes.Data.Attributes.VKN
-	client := new(http.Client)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
-	}
-	if res.StatusCode == http.StatusUnauthorized {
-		if api.RefreshToken() {
-			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-			res, err = client.Do(req)
-			if err != nil {
-				log.Println(err)
-				return response
-			}
-		} else {
-			log.Println("Failed to refresh token")
-			return response
-		}
 	}
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
@@ -1463,34 +1561,24 @@ func (api *API) DeleteTransaction(request *Request) (response Response) {
 	return response
 }
 
-func (api *API) TrackJob(request *Request) (response Response) {
+func (api *API) TrackJob(request *Request, options ...RetryOption) (response Response) {
 	endpoint := "https://api.parasut.com/v4/" + api.Config.CompanyID + "/trackable_jobs/" + request.TrackableJob.Data.ID
-	client := new(http.Client)
+
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
+
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-	res, err := client.Do(req)
+
+	res, err := api.doWithRetry(req, options...)
 	if err != nil {
 		log.Println(err)
 		return response
 	}
-	if res.StatusCode == http.StatusUnauthorized {
-		if api.RefreshToken() {
-			req.Header.Set("Authorization", "Bearer "+api.Authentication.AccessToken)
-			res, err = client.Do(req)
-			if err != nil {
-				log.Println(err)
-				return response
-			}
-		} else {
-			log.Println("Failed to refresh token")
-			return response
-		}
-	}
+
 	defer res.Body.Close()
 	decoder := json.NewDecoder(res.Body)
 	decoder.UseNumber()
